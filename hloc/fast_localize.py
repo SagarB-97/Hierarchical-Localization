@@ -3,11 +3,16 @@ import h5py
 import numpy as np
 import pycolmap
 import torch
+import os
+import cv2
+from pathlib import Path
 
 from .extract_features import ImageDataset, resize_image
 from .utils.parsers import names_to_pair
 from .utils.io import read_image
+from .utils.read_write_model import read_model, write_model, Camera, Image, Point3D
 from .localize_sfm import QueryLocalizer
+from scipy.spatial.transform import Rotation
 
 _default_preprocessing_conf = {
     'globs': ['*.jpg', '*.png', '*.jpeg', '*.JPG', '*.PNG'],
@@ -226,12 +231,89 @@ def get_pose(query_processing_data_dir,
     }
     return ret, log
 
+
+def copy_file(src, dst):
+    with open(src, 'rb') as fsrc:
+        with open(dst, 'wb') as fdst:
+            fdst.write(fsrc.read())
+
+
+def dynamic_update(
+    query_processing_data_dir,
+    query_image_name,
+    db_local_features_path,
+    local_features,
+    db_global_descriptors_path,
+    global_descriptor,
+    db_reconstruction,
+    pose_ret,
+    pose_log):
+
+
+    # Create copies of the local feature and global descriptor .h5 files
+    local_features_copy_path = Path(db_local_features_path).parent / f'copy_{Path(db_local_features_path).name}'
+    copy_file(db_local_features_path, local_features_copy_path)
+
+    global_descriptors_copy_path = Path(db_global_descriptors_path).parent / f'copy_{Path(db_global_descriptors_path).name}'
+    copy_file(db_global_descriptors_path, global_descriptors_copy_path)
+
+    # Update the local feature database
+    with h5py.File(local_features_copy_path, 'a') as f:
+        grp = f.create_group(query_image_name)
+        grp.create_dataset('descriptors', data=local_features['descriptors'])
+        grp.create_dataset('image_size', data=local_features['image_size'])
+        grp.create_dataset('keypoints', data=local_features['keypoints'])
+        grp.create_dataset('scores', data=local_features['scores'])
+
+
+    # Update the global feature database
+    with h5py.File(global_descriptors_copy_path, 'a') as f:
+        grp = f.create_group(query_image_name)
+        grp.create_dataset('global_descriptor', data=global_descriptor['global_descriptor'])
+        grp.create_dataset('image_size', data=global_descriptor['image_size'])
+
+
+    # Add the image, points3D, and camera (if applicable) to the reconstruction
+    cameras, images, points3D = read_model(db_reconstruction)
+
+    query_camera = pycolmap.infer_camera_from_image(query_processing_data_dir / query_image_name)
+
+    # Create and add a new camera
+    new_camera_id = max(cameras.keys()) + 1
+    new_camera = Camera(
+        id=new_camera_id,
+        model=query_camera.model_name,
+        width=query_camera.width,
+        height=query_camera.height,
+        params=query_camera.params
+    )
+    cameras[new_camera_id] = new_camera
+
+    # Create and add a new image
+    new_image_id = max(images.keys()) + 1
+    new_image = Image(
+        id=new_image_id,
+        qvec=pose_ret['qvec'],
+        tvec=pose_ret['tvec'],
+        camera_id=new_camera_id,
+        name=query_image_name,
+        point3D_ids=pose_log['points3D_ids'],
+        xys=local_features['keypoints']
+    )
+    images[new_image_id] = new_image
+
+    model_path = Path(db_reconstruction)
+    output_model_path = model_path.parent / 'updated_reconstruction'
+    os.makedirs(output_model_path, exist_ok=True)
+    write_model(cameras, images, points3D, output_model_path)
+
+
 def localize(query_processing_data_dir, query_image_name, 
              device, 
              local_feature_conf, local_features_extractor_model, 
              global_descriptor_conf, global_descriptor_model, 
-             db_global_descriptors, db_image_names,
-             db_local_features_path, matcher_model, 
+             db_global_descriptors, db_global_descriptors_path, 
+             db_image_names, db_local_features_path, matcher_model, 
              db_reconstruction):
     print(f"Called Localize for image{query_processing_data_dir}")
     print("Running get_local_features")
@@ -283,5 +365,62 @@ def localize(query_processing_data_dir, query_image_name,
         local_features = local_features
     )
     print("Finished get_pose: ", ret['qvec'], ret['tvec'])
+
+    # dynamic_update(
+    #     query_processing_data_dir = query_processing_data_dir,
+    #     query_image_name = query_image_name,
+    #     db_local_features_path = db_local_features_path,
+    #     local_features = local_features,
+    #     db_global_descriptors_path = db_global_descriptors_path,
+    #     global_descriptor = global_descriptor,
+    #     db_reconstruction = db_reconstruction,
+    #     pose_ret = ret,
+    #     pose_log = log)
+
+    def homogenize(rotation, translation):
+        """
+        Combine the (3,3) rotation matrix and (3,) translation matrix to
+        one (4,4) transformation matrix
+        """
+        homogenous_array = np.eye(4)
+        homogenous_array[:3, :3] = rotation
+        homogenous_array[:3, 3] = translation
+        return homogenous_array
+
+    def rot_from_qvec(qvec):
+        # Change (w,x,y,z) to (x,y,z,w)
+        return Rotation.from_quat([qvec[1], qvec[2], qvec[3], qvec[0]])
+
+    reconstruction = pycolmap.Reconstruction(db_reconstruction.__str__())
+    ref_imgs = [reconstruction.find_image_with_name(r) for r in nearest_candidate_images]
+    for i, db_img in enumerate(ref_imgs):
+        this_match, _ = _get_matches_from_tensor(local_matches, query_image_name, db_img.name)
+        query_pose = np.linalg.inv(homogenize(rot_from_qvec(ret['qvec']).as_matrix(), ret['tvec']))[:-1]
+        ref_pose = np.linalg.inv(homogenize(rot_from_qvec(db_img.qvec).as_matrix(), db_img.tvec))[:-1]
+        print(db_img.name)
+        query_points = []
+        ref_points = []
+        for query_kp, db_kp in this_match:
+            q = local_features['keypoints'][query_kp]
+            query = np.array([q[0].item(),q[1].item()])
+            point2D = db_img.points2D[db_kp]
+            ref = np.array(point2D.xy)
+            if point2D.point3D_id == 18446744073709551615:
+                query_points.append(query)
+                ref_points.append(ref)
+        print("query_pose:")
+        print(query_pose)
+        print("ref_pose:")
+        print(ref_pose)
+        print("query_pose:")
+        print(np.array(query_points).T)
+        print("ref_points:")
+        print(np.array(ref_points).T)
+        if len(query_points) > 0:
+            point4D = cv2.triangulatePoints(query_pose, ref_pose, np.array(query_points).T, np.array(ref_points).T)
+            point3D = point4D[:3] / point4D[3]
+            point3D = np.array(point3D).T
+            print("point3D:")
+            print(point3D)
 
     return ret, log
