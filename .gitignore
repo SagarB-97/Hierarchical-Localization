@@ -6,3 +6,4 @@ outputs/
 datasets/*
 query_processing_data/
 !datasets/sacre_coeur/
+data/
