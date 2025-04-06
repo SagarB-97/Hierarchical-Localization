@@ -3,6 +3,9 @@ import h5py
 import numpy as np
 import pycolmap
 import torch
+import os
+import cv2
+from ultralytics import YOLO
 
 from .extract_features import ImageDataset, resize_image
 from .utils.parsers import names_to_pair
@@ -42,6 +45,25 @@ def _get_processed_image(query_dir, query_img_name, preprocessing_conf):
     }
     return data
 
+# COCO class IDs to be extracted
+TARGET_CLASS_IDS = [0, 1, 2, 3, 5, 7, 14, 15, 16, 24, 25, 26, 28, 36, 39, 40, 41, 42, 43, 44, 45, 56, 63, 64, 65, 66, 67]
+
+# Get relevant masks from segmentation model prediction
+# Returns mask (tuple of (class id, mask)) and union_mask (combined mask)
+def extract_masks(results, target_class_ids=TARGET_CLASS_IDS):
+    masks = []
+    union_mask = 0
+    for res in results:
+        if hasattr(res, 'masks'):
+            for i, cls in enumerate(res.boxes.cls):
+                if int(cls) in target_class_ids:
+                    mask = res.masks.data[i].cpu().numpy()
+                    masks.append((int(cls), mask))
+
+                    # Bitwise OR operation to get the union of all masks so far
+                    union_mask = np.bitwise_or(union_mask, mask.astype(np.uint8))
+    return masks, union_mask
+
 def get_local_features(query_processing_data_dir, 
              query_image_name,
              local_feature_conf,
@@ -70,6 +92,36 @@ def get_local_features(query_processing_data_dir,
         local_features['scales'] *= scales.mean()
     # add keypoint uncertainties scaled to the original resolution
     uncertainty = getattr(local_features_extractor_model, 'detection_noise', 1) * scales.mean()
+
+    image_path = os.path.join(query_processing_data_dir, query_image_name)
+    seg_model = YOLO('yolov8x-seg.pt')
+
+    img = cv2.imread(image_path)
+    height, width = np.shape(img)[:2]
+
+    seg_result = seg_model.predict(source=image_path, conf=0.40)
+    masks, union_mask = extract_masks(seg_result)
+    if len(masks) == 0: return local_features, uncertainty
+
+    resized_mask = cv2.resize(union_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    # Filter out masked keypoints
+    valid_keypoints = []
+    valid_descriptors = []
+    valid_scores = []
+    for i, (x, y) in enumerate(local_features['keypoints'].cpu()):
+        if not (0 <= x < width and 0 <= y < height and resized_mask[int(np.round(y)), int(np.round(x))]):
+            valid_keypoints.append([x, y])
+            valid_descriptors.append(local_features['descriptors'].cpu()[:, i])
+            valid_scores.append(local_features['scores'].cpu()[i])
+
+    valid_keypoints = np.array(valid_keypoints)
+    valid_descriptors = np.array(valid_descriptors).T
+    valid_scores = np.array(valid_scores)
+
+    local_features['keypoints'] = torch.from_numpy(valid_keypoints).float().to(device)
+    local_features['descriptors'] = torch.from_numpy(valid_descriptors).float().to(device)
+    local_features['scores'] = torch.from_numpy(valid_scores).float().to(device)
     
     return local_features, uncertainty
 
@@ -170,7 +222,12 @@ def get_pose(query_processing_data_dir,
     ## Now we have global candidate and thier mathces. We use this, along with SfM reconstruction to localize the image.
     reconstruction = pycolmap.Reconstruction(db_reconstruction.__str__())
     query_camera = pycolmap.infer_camera_from_image(query_processing_data_dir / query_image_name)
-    ref_ids = [reconstruction.find_image_with_name(r).image_id for r in nearest_candidate_images]
+    ref_ids = []
+    for r in nearest_candidate_images:
+        image = reconstruction.find_image_with_name(r)
+        if image is not None:  # Check if the image exists in the reconstruction
+            print(f"Processing image: {r}")
+            ref_ids.append(image.image_id)
     conf = {
         'estimation': {'ransac': {'max_error': 12}},
         'refinement': {'refine_focal_length': True, 'refine_extra_params': True},
